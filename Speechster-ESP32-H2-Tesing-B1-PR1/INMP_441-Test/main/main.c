@@ -1,160 +1,135 @@
 #include <stdio.h>
-#include <stdint.h>
 #include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "esp_log.h"
 #include "driver/i2s_std.h"
 #include "driver/uart.h"
+#include "esp_log.h"
 
-#define SAMPLE_RATE         16000
-#define BITS_PER_SAMPLE     16
-#define CHANNELS            1       // Mono
-#define RECORD_DURATION_SEC 5
-#define BUFFER_SIZE         (SAMPLE_RATE * (BITS_PER_SAMPLE / 8) * CHANNELS * RECORD_DURATION_SEC)
+#define TAG "INMP441_UART"
 
-#define I2S_NUM             I2S_NUM_AUTO
-#define UART_NUM            UART_NUM_0
+// Audio config
+#define SAMPLE_RATE     16000
+#define BITS_PER_SAMPLE 16
+#define CHANNELS        1
+#define RECORD_TIME_SEC 5
+#define BUFFER_SAMPLES  512
 
-static const char *TAG = "INMP441";
+// UART config
+#define UART_PORT   UART_NUM_0
+#define UART_BAUD   115200
 
-i2s_chan_handle_t rx_handle = NULL;
+// WAV header size
+#define WAV_HEADER_SIZE 44
 
-/**
- * @brief Generates a simple WAV header
- */
-void generate_wav_header(uint8_t *wav_header, uint32_t data_length, uint32_t sample_rate, uint16_t bits_per_sample, uint16_t channels)
-{
-    uint32_t byte_rate = sample_rate * channels * bits_per_sample / 8;
-    uint16_t block_align = channels * bits_per_sample / 8;
+static i2s_chan_handle_t rx_handle;
 
-    // RIFF chunk
-    memcpy(wav_header, "RIFF", 4);
-    *(uint32_t *)(wav_header + 4) = 36 + data_length;         // ChunkSize
-    memcpy(wav_header + 8, "WAVE", 4);
+// ====== WAV HEADER CREATION ======
+static void wav_header(uint8_t *header, uint32_t data_size) {
+    uint32_t file_size = data_size + WAV_HEADER_SIZE - 8;
+    uint16_t audio_format = 1; // PCM
+    uint16_t block_align = CHANNELS * BITS_PER_SAMPLE / 8;
+    uint32_t byte_rate = SAMPLE_RATE * block_align;
 
-    // fmt subchunk
-    memcpy(wav_header + 12, "fmt ", 4);
-    *(uint32_t *)(wav_header + 16) = 16;                      // Subchunk1Size for PCM
-    *(uint16_t *)(wav_header + 20) = 1;                       // AudioFormat = PCM
-    *(uint16_t *)(wav_header + 22) = channels;
-    *(uint32_t *)(wav_header + 24) = sample_rate;
-    *(uint32_t *)(wav_header + 28) = byte_rate;
-    *(uint16_t *)(wav_header + 32) = block_align;
-    *(uint16_t *)(wav_header + 34) = bits_per_sample;
+    memcpy(header, "RIFF", 4);
+    memcpy(header + 8, "WAVE", 4);
+    memcpy(header + 12, "fmt ", 4);
 
-    // data subchunk
-    memcpy(wav_header + 36, "data", 4);
-    *(uint32_t *)(wav_header + 40) = data_length;
+    uint32_t fmt_chunk_size = 16;
+    memcpy(header + 16, &fmt_chunk_size, 4);
+    memcpy(header + 20, &audio_format, 2);
+    memcpy(header + 22, &((uint16_t)CHANNELS), 2);
+    memcpy(header + 24, &((uint32_t)SAMPLE_RATE), 4);
+    memcpy(header + 28, &byte_rate, 4);
+    memcpy(header + 32, &block_align, 2);
+    memcpy(header + 34, &((uint16_t)BITS_PER_SAMPLE), 2);
+
+    memcpy(header + 36, "data", 4);
+    memcpy(header + 40, &data_size, 4);
+
+    memcpy(header + 4, &file_size, 4);
 }
 
-void record_and_stream_audio()
-{
-    uint8_t *buffer = heap_caps_malloc(BUFFER_SIZE, MALLOC_CAP_DEFAULT);
-    if (!buffer) {
-        ESP_LOGE(TAG, "Failed to allocate buffer");
-        return;
-    }
-
-    size_t bytes_read = 0;
-    size_t total_read = 0;
-    esp_err_t ret;
-
-    ESP_LOGI(TAG, "Recording audio for %d seconds...", RECORD_DURATION_SEC);
-
-    // Read samples from I2S into buffer
-    while (total_read < BUFFER_SIZE) {
-        ret = i2s_channel_read(rx_handle, buffer + total_read, BUFFER_SIZE - total_read, &bytes_read, portMAX_DELAY);
-        if (ret != ESP_OK) {
-            ESP_LOGE(TAG, "I2S read failed: %s", esp_err_to_name(ret));
-            break;
-        }
-        total_read += bytes_read;
-    }
-
-    ESP_LOGI(TAG, "Recording complete. Sending WAV data...");
-
-    // Generate WAV header
-    uint8_t wav_header[44];
-    generate_wav_header(wav_header, BUFFER_SIZE, SAMPLE_RATE, BITS_PER_SAMPLE, CHANNELS);
-
-    // Send data to UART
-    const char *start_tag = "StartAudioWAV\n";
-    const char *stop_tag = "StopAudioWAV\n";
-    uart_write_bytes(UART_NUM, start_tag, strlen(start_tag));
-    uart_write_bytes(UART_NUM, (const char *)wav_header, sizeof(wav_header));
-    uart_write_bytes(UART_NUM, (const char *)buffer, BUFFER_SIZE);
-    uart_write_bytes(UART_NUM, stop_tag, strlen(stop_tag));
-
-    ESP_LOGI(TAG, "WAV transmission complete.");
-
-    free(buffer);
-}
-
-void app_main(void)
-{
-    esp_err_t ret;
-
-    // Configure UART (optional if UART0 already in use)
-    uart_config_t uart_config = {
-        .baud_rate = 115200,
+// ====== INIT UART ======
+static void uart_init(void) {
+    const uart_config_t uart_config = {
+        .baud_rate = UART_BAUD,
         .data_bits = UART_DATA_8_BITS,
         .parity    = UART_PARITY_DISABLE,
         .stop_bits = UART_STOP_BITS_1,
         .flow_ctrl = UART_HW_FLOWCTRL_DISABLE
     };
-    uart_param_config(UART_NUM, &uart_config);
-    uart_driver_install(UART_NUM, 2048, 0, 0, NULL, 0);
+    ESP_ERROR_CHECK(uart_driver_install(UART_PORT, 2048, 0, 0, NULL, 0));
+    ESP_ERROR_CHECK(uart_param_config(UART_PORT, &uart_config));
+    ESP_ERROR_CHECK(uart_set_pin(UART_PORT, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE,
+                                 UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
+}
 
-    // Channel config
-    i2s_chan_config_t chan_cfg = {
-        .id = I2S_NUM,
-        .role = I2S_ROLE_MASTER,
-        .dma_desc_num = 6,
-        .dma_frame_num = 240,
-        .auto_clear_after_cb = false,
-        .auto_clear_before_cb = false,
-        .intr_priority = 0,
-        .allow_pd = false
-    };
-
-    ret = i2s_new_channel(&chan_cfg, NULL, &rx_handle);
-    ESP_ERROR_CHECK(ret);
-
-    // Clock config
-    i2s_std_clk_config_t clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(SAMPLE_RATE);
-
-    // Slot config (16-bit, mono)
-    i2s_std_slot_config_t slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(
-        I2S_DATA_BIT_WIDTH_16BIT,
-        I2S_SLOT_MODE_MONO
-    );
-
-    // GPIO config for INMP441
-    i2s_std_gpio_config_t gpio_cfg = {
-        .mclk = I2S_GPIO_UNUSED,
-        .bclk = GPIO_NUM_10,
-        .ws   = GPIO_NUM_11,
-        .dout = I2S_GPIO_UNUSED,
-        .din  = GPIO_NUM_12
-    };
+// ====== INIT I2S ======
+static void i2s_init(void) {
+    i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
+    ESP_ERROR_CHECK(i2s_new_channel(&chan_cfg, NULL, &rx_handle));
 
     i2s_std_config_t std_cfg = {
-        .clk_cfg = clk_cfg,
-        .slot_cfg = slot_cfg,
-        .gpio_cfg = gpio_cfg,
+        .clk_cfg  = I2S_STD_CLK_DEFAULT_CONFIG(SAMPLE_RATE),
+        .slot_cfg = I2S_STD_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT,
+                                                I2S_SLOT_MODE_MONO),
+        .gpio_cfg = {
+            .mclk = I2S_GPIO_UNUSED,
+            .bclk = 7,   // BCLK pin
+            .ws   = 8,   // LRCLK pin
+            .dout = I2S_GPIO_UNUSED,
+            .din  = 6    // DIN from INMP441
+        }
     };
+    ESP_ERROR_CHECK(i2s_channel_init_std_mode(rx_handle, &std_cfg));
+    ESP_ERROR_CHECK(i2s_channel_enable(rx_handle));
+}
 
-    ret = i2s_channel_init_std_mode(rx_handle, &std_cfg);
-    ESP_ERROR_CHECK(ret);
-    ret = i2s_channel_enable(rx_handle);
-    ESP_ERROR_CHECK(ret);
+// ====== MAIN TASK ======
+void app_main(void) {
+    uart_init();
+    i2s_init();
 
-    ESP_LOGI(TAG, "I2S RX channel started. Ready to record.");
+    ESP_LOGI(TAG, "Starting 5 sec recording...");
 
-    // Loop to record and stream audio every 5 seconds
-    while (1) {
-        record_and_stream_audio();
-        vTaskDelay(pdMS_TO_TICKS(6000));  // Add 1 sec pause between recordings
+    size_t total_samples = SAMPLE_RATE * RECORD_TIME_SEC;
+    size_t total_bytes   = total_samples * (BITS_PER_SAMPLE / 8);
+
+    // Allocate buffer
+    int16_t *audio_buf = heap_caps_malloc(total_samples * sizeof(int16_t), MALLOC_CAP_DEFAULT);
+    if (!audio_buf) {
+        ESP_LOGE(TAG, "Failed to allocate audio buffer");
+        return;
     }
+
+    size_t bytes_read = 0, bytes_written = 0, idx = 0;
+    int16_t temp_buf[BUFFER_SAMPLES];
+
+    while (idx < total_samples) {
+        i2s_channel_read(rx_handle, temp_buf, sizeof(temp_buf), &bytes_read, portMAX_DELAY);
+        size_t samples_read = bytes_read / sizeof(int16_t);
+
+        for (size_t i = 0; i < samples_read && idx < total_samples; i++) {
+            audio_buf[idx++] = temp_buf[i];
+        }
+    }
+
+    ESP_LOGI(TAG, "Recording finished, sending WAV...");
+
+    // Send framing header
+    uint8_t frame_header[2] = {0xAA, 0x55};
+    uart_write_bytes(UART_PORT, (const char *)frame_header, 2);
+
+    // Send WAV header
+    uint8_t header[WAV_HEADER_SIZE];
+    wav_header(header, total_bytes);
+    uart_write_bytes(UART_PORT, (const char *)header, WAV_HEADER_SIZE);
+
+    // Send audio data
+    uart_write_bytes(UART_PORT, (const char *)audio_buf, total_bytes);
+
+    ESP_LOGI(TAG, "WAV file sent over UART");
+
+    free(audio_buf);
 }
